@@ -25,13 +25,40 @@ function varName(nodeId: string, portId: string, prefix: string): string {
   return `${prefix}_${clean}_${portId}`;
 }
 
-/** Python literal for a parameter value */
+/**
+ * Raw substitution value for a parameter. Strings are returned verbatim — the
+ * long-standing convention is that templates quote them where a string literal
+ * is wanted (e.g. `if "{{params.mode}}" == "auto"`), so this must NOT quote.
+ * Use {{params.x|literal}} / pyLiteral() when you need a safe, quoted literal.
+ */
 function paramToPython(val: unknown): string {
   if (val === undefined || val === null) return "None";
   if (typeof val === "boolean") return val ? "True" : "False";
   if (typeof val === "number") return String(val);
   if (typeof val === "string") return val;
   return JSON.stringify(val) ?? "None";
+}
+
+/**
+ * A properly-quoted, escaped Python literal for any JSON-ish value. Strings are
+ * emitted as safe double-quoted literals (quotes, backslashes, and newlines
+ * escaped) so user input can never break out of — or inject into — the
+ * generated source. Mirrors the assembler's pyLiteral so both codegen paths
+ * agree. Exposed via the {{params.x|literal}} interpolation filter.
+ */
+export function pyLiteral(val: unknown): string {
+  if (val === null || val === undefined) return "None";
+  if (typeof val === "boolean") return val ? "True" : "False";
+  if (typeof val === "number") return Number.isFinite(val) ? String(val) : "float('nan')";
+  if (typeof val === "string") return JSON.stringify(val);
+  if (Array.isArray(val)) return `[${val.map(pyLiteral).join(", ")}]`;
+  if (typeof val === "object") {
+    const entries = Object.entries(val as Record<string, unknown>)
+      .map(([k, v]) => `${JSON.stringify(k)}: ${pyLiteral(v)}`)
+      .join(", ");
+    return `{${entries}}`;
+  }
+  return "None";
 }
 
 /** Interpolate {{params}}, {{inputs}}, {{outputs}}, {{branches}} in template text */
@@ -44,9 +71,11 @@ function interpolate(
 ): string {
   let result = template;
 
-  // Replace {{params.xxx}}
-  result = result.replace(/\{\{params\.(\w+)\}\}/g, (_match, key) => {
-    return paramToPython(params[key]);
+  // Replace {{params.xxx}} (raw) and {{params.xxx|literal}} (safe Python literal).
+  // The raw form preserves the existing template convention of quoting manually;
+  // the |literal form emits a properly-escaped literal for user-provided strings.
+  result = result.replace(/\{\{params\.(\w+)(\|literal)?\}\}/g, (_match, key, filter) => {
+    return filter ? pyLiteral(params[key]) : paramToPython(params[key]);
   });
 
   // Replace {{inputs.xxx}}
