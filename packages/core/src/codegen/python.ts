@@ -92,9 +92,15 @@ function interpolate(
     });
   }
 
-  // Replace {{branches.xxx}} with indented branch bodies
-  result = result.replace(/\{\{branches\.(\w+)\}\}/g, (_match, key) => {
-    return branchBodies[key] ?? "pass";
+  // Replace {{branches.xxx}} with the (possibly multi-line) branch body,
+  // indenting every line to the column the placeholder sits at so nested
+  // Python stays syntactically valid.
+  result = result.replace(/([ \t]*)\{\{branches\.(\w+)\}\}/g, (_match, indent, key) => {
+    const body = branchBodies[key] ?? "pass";
+    return body
+      .split("\n")
+      .map((line) => (line.length > 0 ? indent + line : line))
+      .join("\n");
   });
 
   return result;
@@ -120,76 +126,99 @@ export function generatePython(
   // Map: nodeId:portId -> python variable name
   const outputVarMap = new Map<string, string>();
 
-  for (const nodeId of sorted) {
+  // Position of each node in the topological order (for ordering branch children).
+  const sortedIndex = new Map<string, number>(sorted.map((id, i) => [id, i]));
+
+  // Nodes that live inside a scope block's branch — emitted within their parent,
+  // not at the top level. (The editor does not yet populate branchChildren, so
+  // for ordinary graphs this set is empty and behavior is unchanged.)
+  const branchChildSet = new Set<string>();
+  for (const node of Object.values(graph.nodes)) {
+    if (!node.branchChildren) continue;
+    for (const childIds of Object.values(node.branchChildren)) {
+      for (const id of childIds) branchChildSet.add(id);
+    }
+  }
+
+  const emitted = new Set<string>();
+
+  /**
+   * Produce the Python body lines for one node (comment + body + output-var
+   * assignments), registering its output variables and collecting its imports /
+   * setup / teardown. Scope blocks recurse: each branch's children are emitted
+   * here and spliced into the block's {{branches.x}} placeholders.
+   */
+  function emitNode(nodeId: string): string[] {
+    if (emitted.has(nodeId)) return [];
     const node = graph.nodes[nodeId];
-    if (!node) continue;
+    if (!node) return [];
     const blockDef = registry.get(node.blockId);
-    if (!blockDef) continue;
-
+    if (!blockDef) return [];
     const template = blockDef.codeTemplate;
-    if (!template) continue; // non-pipeline kinds (scaffold/file/…) are handled by ProjectCompiler
+    if (!template) return []; // non-pipeline kinds handled by ProjectCompiler
+    emitted.add(nodeId);
 
-    // Collect imports
-    for (const imp of template.imports) {
-      allImports.add(imp);
-    }
+    for (const imp of template.imports) allImports.add(imp);
 
-    // Build input bindings: which python variable feeds each input port
+    // Build input bindings: which python variable feeds each input port.
     const inputBindings: Record<string, string> = {};
-    const incoming = getIncomingEdges(graph, nodeId);
-    for (const edge of incoming) {
-      const srcKey = `${edge.sourceNodeId}:${edge.sourcePortId}`;
-      const srcVar = outputVarMap.get(srcKey);
-      if (srcVar) {
-        inputBindings[edge.targetPortId] = srcVar;
-      }
+    for (const edge of getIncomingEdges(graph, nodeId)) {
+      const srcVar = outputVarMap.get(`${edge.sourceNodeId}:${edge.sourcePortId}`);
+      if (srcVar) inputBindings[edge.targetPortId] = srcVar;
     }
 
-    // Branch bodies (for scope blocks — placeholder pass for now)
+    // Branch bodies: recursively emit each branch's children (in topological
+    // order), joined into one block. Empty branch => `pass`.
     const branchBodies: Record<string, string> = {};
     if (node.branchChildren) {
       for (const [branchId, childIds] of Object.entries(node.branchChildren)) {
-        if (childIds.length === 0) {
-          branchBodies[branchId] = "pass";
-        } else {
-          branchBodies[branchId] = `# [${childIds.length} block(s)]`;
-        }
+        const ordered = [...childIds].sort(
+          (a, b) => (sortedIndex.get(a) ?? 0) - (sortedIndex.get(b) ?? 0)
+        );
+        const childBlocks = ordered
+          .map((cid) => emitNode(cid))
+          .filter((lines) => lines.length > 0)
+          .map((lines) => lines.join("\n"));
+        branchBodies[branchId] = childBlocks.length > 0 ? childBlocks.join("\n") : "pass";
       }
     }
 
     const outputShortNames = template.outputBindings;
 
-    // Generate setup
     if (template.setup) {
       setupLines.push(
         interpolate(template.setup, node.parameters, inputBindings, branchBodies, outputShortNames)
       );
     }
 
-    // Generate body
-    if (opts.comments) {
-      const label = node.label ?? blockDef.name;
-      bodyLines.push(`# ${label}`);
-    }
-    bodyLines.push(
+    const lines: string[] = [];
+    if (opts.comments) lines.push(`# ${node.label ?? blockDef.name}`);
+    lines.push(
       interpolate(template.body, node.parameters, inputBindings, branchBodies, outputShortNames)
     );
 
-    // Register output variables (graph-facing names → short local names)
     for (const [portId, expr] of Object.entries(template.outputBindings)) {
       const vName = varName(nodeId, portId, opts.varPrefix);
       const resolved = interpolate(expr, node.parameters, inputBindings, branchBodies, undefined);
-      bodyLines.push(`${vName} = ${resolved}`);
+      lines.push(`${vName} = ${resolved}`);
       outputVarMap.set(`${nodeId}:${portId}`, vName);
     }
 
-    bodyLines.push(""); // blank line between blocks
-
-    // Generate teardown
     if (template.teardown) {
       teardownLines.push(
         interpolate(template.teardown, node.parameters, inputBindings, branchBodies, outputShortNames)
       );
+    }
+
+    return lines;
+  }
+
+  for (const nodeId of sorted) {
+    if (branchChildSet.has(nodeId)) continue; // emitted inside its parent scope
+    const lines = emitNode(nodeId);
+    if (lines.length > 0) {
+      bodyLines.push(...lines);
+      bodyLines.push(""); // blank line between top-level blocks
     }
   }
 
